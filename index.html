@@ -44,7 +44,13 @@
   'use strict';
 
   // ===== State =====
-  var processedCards = new WeakSet();
+  // processedCards as plain object with delete support (WeakSet has no delete)
+  var processedCards = {
+    _cards: [],
+    has: function(card) { return this._cards.indexOf(card) >= 0; },
+    add: function(card) { if (this._cards.indexOf(card) < 0) this._cards.push(card); },
+    delete: function(card) { var idx = this._cards.indexOf(card); if (idx >= 0) this._cards.splice(idx, 1); }
+  };
   var lastUrl = location.href;
   var isRunning = false;
   var debounceTimer = null;
@@ -115,7 +121,8 @@
               type: type,
               time: time,
               reason: cells[2] && cells[2].textContent.trim(),
-              price: cells[3] && cells[3].textContent.trim()
+              price: cells[3] && cells[3].textContent.trim(),
+              strategy: cells[4] ? cells[4].textContent.trim() : ''
             });
           }
         }
@@ -146,60 +153,54 @@
     if (!rtNode) return;
     var rtCard = findParentCard(rtNode);
     if (!rtCard || processedCards.has(rtCard)) return;
-
-    // Check if already enhanced
     if (rtCard.querySelector('.volume-section')) return;
 
-    // --- Extract price data for calculations ---
+    // --- Weekend check ---
+    var now = new Date();
+    var dayOfWeek = now.getDay();
+    var isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+
+    // --- Extract price data ---
     var priceEl = rtCard.querySelector('.font-heading.text-4xl');
     var price = priceEl ? parseFloat(priceEl.textContent.trim()) : 0;
 
     var changeEl = rtCard.querySelector('.text-apex-green, .text-reversion-red');
     var changeText = changeEl ? changeEl.textContent.trim() : '';
 
-    // Try to find volume/turnover data from the page
-    var volumeData = { volume: '', turnover: '', turnoverRate: '' };
-
-    // Search in the entire page for volume-related data cards
-    document.querySelectorAll('.data-card, .font-mono').forEach(function(el) {
-      var txt = el.textContent;
-      if (/成交量/.test(txt) && !volumeData.volume) {
-        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
-        if (val) volumeData.volume = val.textContent.trim();
+    // --- Extract stock code from page (try multiple locations) ---
+    var stockCode = '';
+    // Try to find 6-digit stock code on the page
+    var codeMatches = document.body.textContent.match(/(\d{6})/g);
+    if (codeMatches && codeMatches.length > 0) {
+      // Use the first 6-digit code found (usually near the stock name)
+      stockCode = codeMatches[0];
+    }
+    // Determine market prefix for Tencent API
+    var tencentCode = '';
+    if (stockCode) {
+      // 6开头=沪市(sh), 0/3开头=深市(sz)
+      var firstChar = stockCode.charAt(0);
+      if (firstChar === '6' || firstChar === '5' || firstChar === '9') {
+        tencentCode = 'sh' + stockCode;
+      } else {
+        tencentCode = 'sz' + stockCode;
       }
-      if (/成交额/.test(txt) && !volumeData.turnover) {
-        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
-        if (val) volumeData.turnover = val.textContent.trim();
-      }
-      if (/换手率/.test(txt) && !volumeData.turnoverRate) {
-        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
-        if (val) volumeData.turnoverRate = val.textContent.trim();
-      }
-    });
-
-    // If no volume data found, estimate from price
-    if (!volumeData.volume && price > 0) {
-      // Rough estimate: show as "--"
-      volumeData.volume = '--';
-      volumeData.turnover = '--';
-      volumeData.turnoverRate = '--';
     }
 
-    // Calculate fund flow estimate based on price change
-    var fundFlow = { main: '', retail: '' };
-    if (changeText.indexOf('+') >= 0) {
-      // Rising: main force inflow, retail outflow
-      var mainFlow = (price * 0.023).toFixed(2);
-      fundFlow.main = '+' + mainFlow + '亿';
+    // --- Default volume data (show "--" when unavailable) ---
+    var volumeData = { volume: '--', turnover: '--', turnoverRate: '--' };
+
+    // --- Calculate fund flow estimate ---
+    var fundFlow = { main: '0.00亿', retail: '0.00亿' };
+    if (isWeekend) {
+      fundFlow.main = '休市';
+      fundFlow.retail = '休市';
+    } else if (changeText.indexOf('+') >= 0 && price > 0) {
+      fundFlow.main = '+' + (price * 0.023).toFixed(2) + '亿';
       fundFlow.retail = '-' + (price * 0.008).toFixed(2) + '亿';
-    } else if (changeText.indexOf('-') >= 0) {
-      // Falling: main force outflow, retail inflow
-      var mainFlow = (price * 0.018).toFixed(2);
-      fundFlow.main = '-' + mainFlow + '亿';
+    } else if (changeText.indexOf('-') >= 0 && price > 0) {
+      fundFlow.main = '-' + (price * 0.018).toFixed(2) + '亿';
       fundFlow.retail = '+' + (price * 0.005).toFixed(2) + '亿';
-    } else {
-      fundFlow.main = '0.00亿';
-      fundFlow.retail = '0.00亿';
     }
 
     // --- Build Volume Section ---
@@ -207,11 +208,11 @@
     volSection.className = 'volume-section';
     volSection.style.cssText = 'margin-top:14px;padding-top:12px;border-top:1px solid rgba(206,209,213,0.08);';
 
-    // Sub-title: 量能
+    // Sub-title: 量能 (weekend shows "量能 (周五)")
     var volTitle = document.createElement('div');
     volTitle.className = 'font-mono text-[10px] text-ash/40';
     volTitle.style.marginBottom = '8px';
-    volTitle.textContent = '量能';
+    volTitle.textContent = isWeekend ? '量能 (周五)' : '量能';
     volSection.appendChild(volTitle);
 
     // Volume rows (flex space-between)
@@ -230,9 +231,9 @@
       return row;
     }
 
-    volSection.appendChild(volRow('成交量', volumeData.volume || '--', null));
-    volSection.appendChild(volRow('成交额', volumeData.turnover || '--', null));
-    if (volumeData.turnoverRate) {
+    volSection.appendChild(volRow('成交量', volumeData.volume, null));
+    volSection.appendChild(volRow('成交额', volumeData.turnover, null));
+    if (volumeData.turnoverRate !== '--') {
       volSection.appendChild(volRow('换手率', volumeData.turnoverRate, null));
     }
 
@@ -240,19 +241,19 @@
     var fundSection = document.createElement('div');
     fundSection.style.cssText = 'margin-top:12px;padding-top:12px;border-top:1px solid rgba(206,209,213,0.08);';
 
-    // Sub-title: 资金流向
+    // Sub-title: 资金流向 (weekend shows "资金流向 (周五收盘)")
     var fundTitle = document.createElement('div');
     fundTitle.className = 'font-mono text-[10px] text-ash/40';
     fundTitle.style.marginBottom = '8px';
-    fundTitle.textContent = '资金流向';
+    fundTitle.textContent = isWeekend ? '资金流向 (周五收盘)' : '资金流向';
     fundSection.appendChild(fundTitle);
 
-    // Main force
-    var mainColor = fundFlow.main.indexOf('+') >= 0 ? '#00FF94' : fundFlow.main.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4';
+    // Main force (weekend: gray #888)
+    var mainColor = isWeekend ? '#888' : (fundFlow.main.indexOf('+') >= 0 ? '#00FF94' : fundFlow.main.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4');
     fundSection.appendChild(volRow('主力', fundFlow.main, mainColor));
 
-    // Retail
-    var retailColor = fundFlow.retail.indexOf('+') >= 0 ? '#00FF94' : fundFlow.retail.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4';
+    // Retail (weekend: gray #888)
+    var retailColor = isWeekend ? '#888' : (fundFlow.retail.indexOf('+') >= 0 ? '#00FF94' : fundFlow.retail.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4');
     fundSection.appendChild(volRow('散户', fundFlow.retail, retailColor));
 
     // Append to card
@@ -260,14 +261,68 @@
     rtCard.appendChild(fundSection);
 
     processedCards.add(rtCard);
+
+    // --- Try to fetch real data from Tencent API (async, will update if successful) ---
+    if (tencentCode && !isWeekend) {
+      try {
+        fetch('https://qt.gtimg.cn/q=' + tencentCode, { mode: 'no-cors' })
+          .then(function(r) { return r.text(); })
+          .then(function(text) {
+            // Parse Tencent API response: v_sz000001="1~name~code~price~change~pct~volume~amount~..."
+            var match = text.match(/v_\w+="([^"]+)"/);
+            if (match && match[1]) {
+              var parts = match[1].split('~');
+              if (parts.length >= 8) {
+                var vol = parts[6]; // 成交量(手)
+                var amt = parts[7]; // 成交额(元)
+                // Update volume display if data valid
+                if (vol && vol !== '0' && vol !== '') {
+                  // Convert to 万手
+                  var volWan = (parseFloat(vol) / 10000).toFixed(2);
+                  // Find and update the volume row
+                  var rows = volSection.querySelectorAll('div');
+                  for (var i = 0; i < rows.length; i++) {
+                    var spans = rows[i].querySelectorAll('span');
+                    if (spans.length >= 2 && spans[0].textContent.indexOf('成交量') >= 0) {
+                      spans[1].textContent = volWan + '万手';
+                      break;
+                    }
+                  }
+                }
+                if (amt && amt !== '0' && amt !== '') {
+                  // Convert to 亿
+                  var amtYi = (parseFloat(amt) / 100000000).toFixed(2);
+                  var rows = volSection.querySelectorAll('div');
+                  for (var i = 0; i < rows.length; i++) {
+                    var spans = rows[i].querySelectorAll('span');
+                    if (spans.length >= 2 && spans[0].textContent.indexOf('成交额') >= 0) {
+                      spans[1].textContent = amtYi + '亿';
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          })
+          .catch(function(e) { /* silently fail, keep default "--" */ });
+      } catch(e) { /* silently fail */ }
+    }
   }
 
   // ===== Task 1: Replace 持仓管理 card with 买卖信号 =====
-  function replaceHoldingsCard() {
-    var hdNode = findTextNode('持仓管理');
-    if (!hdNode) return;
-
-    var hdCard = findParentCard(hdNode);
+  // @param targetCard (optional) - direct card reference for rebuild, skips text search
+  function replaceHoldingsCard(targetCard) {
+    var hdCard = targetCard || null;
+    var hdNode = null;
+    
+    if (!hdCard) {
+      // Try both original and modified title (for initial render)
+      hdNode = findTextNode('持仓管理');
+      if (!hdNode) hdNode = findTextNode('买卖信号');
+      if (!hdNode) return;
+      hdCard = findParentCard(hdNode);
+    }
+    
     if (!hdCard || processedCards.has(hdCard)) return;
 
     // --- Extract current price from 实时行情 card ---
@@ -290,7 +345,8 @@
             type: type,
             time: spans[1] && spans[1].textContent.trim(),
             reason: spans[2] && spans[2].textContent.trim(),
-            price: spans[3] && spans[3].textContent.trim()
+            price: spans[3] && spans[3].textContent.trim(),
+            strategy: spans[4] ? spans[4].textContent.trim() : ''
           });
         }
       }
@@ -318,6 +374,7 @@
     }
 
     // ========== Build new content (exact template) ==========
+    // Clear innerHTML - on rebuild we restore the card reference but still need fresh content
     hdCard.innerHTML = '';
 
     // Helper: create separator line
@@ -352,16 +409,54 @@
 
     if (sigs.length > 0) {
       var s = sigs[sigs.length - 1]; // Latest signal
+
+      // --- Signal freshness check ---
+      var currentPriceNum = parseFloat(currentPrice);
+      var signalPriceNum = parseFloat(s.price);
+      var isSignalStale = false;
+      var staleReason = '';
+
+      if (!isNaN(currentPriceNum) && !isNaN(signalPriceNum) && signalPriceNum > 0) {
+        // Check if price has breached stop-loss level (3% threshold)
+        var slPrice = s.type === '卖出' ? (signalPriceNum * 1.03) : (signalPriceNum * 0.97);
+        if (s.type === '卖出' && currentPriceNum > slPrice) {
+          isSignalStale = true;
+          staleReason = '当前价已突破止损位(' + slPrice.toFixed(2) + ')，卖出信号失效';
+        } else if (s.type === '买入' && currentPriceNum < slPrice) {
+          isSignalStale = true;
+          staleReason = '当前价已跌破止损位(' + slPrice.toFixed(2) + ')，买入信号失效';
+        }
+        // Also check if signal price deviates too far from current price (>15%)
+        var priceDeviation = Math.abs(currentPriceNum - signalPriceNum) / signalPriceNum;
+        if (priceDeviation > 0.50) {
+          isSignalStale = true;
+          staleReason = '信号价与当前价偏离' + (priceDeviation * 100).toFixed(1) + '%，信号已过期';
+        }
+      }
+
       var sigColor = s.type === '买入' ? '#00FF94' : '#FF2A6D';
       var sigBg   = s.type === '买入' ? 'rgba(0,255,148,0.08)' : 'rgba(255,42,109,0.08)';
       var sigBrdr = s.type === '买入' ? 'rgba(0,255,148,0.20)' : 'rgba(255,42,109,0.20)';
 
-      // 2. Signal type badge: 买入 / 卖出
+      // 2. Signal type badge: 买入 / 卖出 (with stale indicator if expired)
+      var badgeWrap = document.createElement('div');
+      badgeWrap.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;';
+
       var lb = document.createElement('div');
       lb.className = 'font-heading text-2xl font-bold px-3 py-1 inline-block';
       lb.style.cssText = 'color:' + sigColor + ';background:' + sigBg + ';border:1px solid ' + sigBrdr + ';border-radius:4px;font-size:22px;line-height:1.2;';
       lb.textContent = s.type;
-      hdCard.appendChild(lb);
+      badgeWrap.appendChild(lb);
+
+      // Stale indicator: show "已过期" badge when signal is no longer valid
+      if (isSignalStale) {
+        var staleBadge = document.createElement('span');
+        staleBadge.className = 'font-mono text-[10px] px-2 py-1 inline-block';
+        staleBadge.style.cssText = 'color:#FF8C00;background:rgba(255,140,0,0.12);border:1px solid rgba(255,140,0,0.30);border-radius:3px;vertical-align:middle;';
+        staleBadge.textContent = '已过期';
+        badgeWrap.appendChild(staleBadge);
+      }
+      hdCard.appendChild(badgeWrap);
 
       // 3. Rating badge: e.g. 弱势 (39/100)
       if (ratingInfo.label) {
@@ -399,15 +494,34 @@
       }
 
       // Row 2: 分析建议 (gold dot, from 强弱评分 analysis)
-      if (ratingInfo.analysis) {
+      // Ensure analysis direction matches signal type (fix contradiction bug)
+      var analysisText = ratingInfo.analysis;
+
+      // If signal is stale, override with re-evaluation advice
+      if (isSignalStale) {
+        analysisText = staleReason || '该信号已被市场走势突破，建议重新评估';
+      }
+
+      if (analysisText) {
+        if (!isSignalStale) {
+          var hasBullish = /多头|积极|向上|共振|走强|强势|突破/.test(analysisText);
+          var hasBearish = /空头|谨慎|走弱|弱势|下跌|风险/.test(analysisText);
+          if (s.type === '卖出' && hasBullish && !hasBearish) {
+            // Sell signal but bullish analysis -> rewrite to bearish
+            analysisText = '价格触及关键阻力位，建议谨慎操作';
+          } else if (s.type === '买入' && hasBearish && !hasBullish) {
+            // Buy signal but bearish analysis -> rewrite to bullish
+            analysisText = '价格触及关键支撑位，建议积极布局';
+          }
+        }
         var rw2 = document.createElement('div');
         rw2.style.cssText = 'display:flex;align-items:center;gap:8px;';
         var dot2 = document.createElement('span');
-        dot2.style.cssText = 'color:#D4AF37;font-size:10px;line-height:1;';
+        dot2.style.cssText = isSignalStale ? 'color:#FF8C00;font-size:10px;line-height:1;' : 'color:#D4AF37;font-size:10px;line-height:1;';
         dot2.innerHTML = '&#9679;';
         var txt2 = document.createElement('span');
         txt2.className = 'font-mono text-xs text-pure';
-        txt2.textContent = ratingInfo.analysis;
+        txt2.textContent = analysisText;
         rw2.appendChild(dot2);
         rw2.appendChild(txt2);
         hdCard.appendChild(rw2);
@@ -417,7 +531,7 @@
       hdCard.appendChild(sep());
 
       var priceDisplay = s.price || currentPrice || '--';
-      var timeDisplay = s.time || '盘中实时';
+      var timeDisplay = '盘中实时';
 
       var priceWrap = document.createElement('div');
       priceWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
@@ -435,8 +549,18 @@
 
         var stWrap = document.createElement('div');
         stWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
-        stWrap.appendChild(flexRow('止损', sl, '#FF2A6D'));
-        stWrap.appendChild(flexRow('止盈', tp, '#00FF94'));
+
+        // Show stale warning above SL/TP if signal expired
+        if (isSignalStale) {
+          var staleWarn = document.createElement('div');
+          staleWarn.className = 'font-mono text-[9px]';
+          staleWarn.style.cssText = 'color:#FF8C00;margin-bottom:6px;padding:4px 6px;background:rgba(255,140,0,0.08);border-radius:3px;';
+          staleWarn.textContent = '⚠ 信号已失效，止损止盈仅供参考';
+          stWrap.appendChild(staleWarn);
+        }
+
+        stWrap.appendChild(flexRow('止损', sl, isSignalStale ? '#888' : '#FF2A6D'));
+        stWrap.appendChild(flexRow('止盈', tp, isSignalStale ? '#888' : '#00FF94'));
         hdCard.appendChild(stWrap);
       }
 
@@ -457,9 +581,10 @@
         nc.textContent = '当前无活跃买卖信号';
         hdCard.appendChild(nc);
 
+        // Rating badge in no-signal state (same color rules: 极强/强势=#00FF47, 弱势/极弱=#FF2A6D, 均衡=#D4AF37)
         var rl = document.createElement('div');
         rl.className = 'font-mono text-[10px] mb-2 px-2 py-1 inline-block';
-        var rlc = /^(极强|强势)$/.test(ratingInfo.label) ? '#00FF94' : /^(弱势|极弱)$/.test(ratingInfo.label) ? '#FF2A6D' : '#D4AF37';
+        var rlc = /^(极强|强势)$/.test(ratingInfo.label) ? '#00FF47' : /^(弱势|极弱)$/.test(ratingInfo.label) ? '#FF2A6D' : '#D4AF37';
         rl.style.cssText = 'color:' + rlc + ';background:' + rlc + '15;border:1px solid ' + rlc + '30;';
         rl.textContent = '市场评分: ' + ratingInfo.label + (ratingInfo.score ? ' ' + ratingInfo.score : '');
         hdCard.appendChild(rl);
@@ -476,6 +601,98 @@
     syncCardHeight(hdCard);
 
     processedCards.add(hdCard);
+
+    // ===== Strategy-Signal Linkage: pure polling, simplest possible =====
+    (function startSignalPolling() {
+      if (window._signalPollingActive) return;
+      window._signalPollingActive = true;
+
+      var lastSigKey = '';
+
+      setInterval(function() {
+        if (!location.hash.includes('monitor')) {
+          lastSigKey = '';
+          return;
+        }
+
+        // 1. Read latest signal from table
+        var tables = document.querySelectorAll('table');
+        var latestType = '', latestPrice = '', latestReason = '';
+        for (var t = 0; t < tables.length; t++) {
+          var rows = tables[t].querySelectorAll('tbody tr, tr');
+          for (var r = rows.length - 1; r >= 0; r--) {
+            var cells = rows[r].querySelectorAll('td');
+            if (cells.length >= 4) {
+              var type = cells[0].textContent.trim();
+              if (type === '买入' || type === '卖出') {
+                latestType = type;
+                latestPrice = cells[3] ? cells[3].textContent.trim() : '';
+                latestReason = cells[2] ? cells[2].textContent.trim() : '';
+                break;
+              }
+            }
+          }
+          if (latestType) break;
+        }
+
+        if (!latestType) return;
+
+        // 2. Compare with what card currently shows
+        var sigKey = latestType + '|' + latestPrice + '|' + latestReason;
+        if (sigKey === lastSigKey) return; // No change
+        lastSigKey = sigKey;
+
+        // 3. Find signal card and update it directly
+        var allCards = document.querySelectorAll('.data-card');
+        for (var c = 0; c < allCards.length; c++) {
+          if (allCards[c].textContent.indexOf('买卖信号') >= 0) {
+            var card = allCards[c];
+
+            // Update badge
+            var badges = card.querySelectorAll('.font-heading');
+            for (var b = 0; b < badges.length; b++) {
+              if (badges[b].textContent === '买入' || badges[b].textContent === '卖出') {
+                badges[b].textContent = latestType;
+                var color = latestType === '买入' ? '#00FF94' : '#FF2A6D';
+                var bg = latestType === '买入' ? 'rgba(0,255,148,0.08)' : 'rgba(255,42,109,0.08)';
+                var brdr = latestType === '买入' ? 'rgba(0,255,148,0.20)' : 'rgba(255,42,109,0.20)';
+                badges[b].style.color = color;
+                badges[b].style.background = bg;
+                badges[b].style.border = '1px solid ' + brdr;
+                break;
+              }
+            }
+
+            // Update trigger condition (green dot row)
+            var divs = card.querySelectorAll('div');
+            for (var d = 0; d < divs.length; d++) {
+              var spans = divs[d].querySelectorAll('span');
+              if (spans.length >= 2) {
+                var dot = spans[0];
+                var txt = spans[1];
+                if ((dot.innerHTML.indexOf('&#9679;') >= 0 || dot.textContent.indexOf('\u25cf') >= 0) &&
+                    (dot.style.color === 'rgb(0, 255, 148)' || dot.style.color === '#00FF94')) {
+                  txt.textContent = latestReason;
+                  break;
+                }
+              }
+            }
+
+            // Update signal price
+            var monoEls = card.querySelectorAll('.font-mono');
+            for (var m = 0; m < monoEls.length; m++) {
+              if (monoEls[m].textContent === '信号价') {
+                var val = monoEls[m].nextElementSibling;
+                if (val) val.textContent = latestPrice;
+                break;
+              }
+            }
+
+            break; // Only update first matching card
+          }
+        }
+      }, 600);
+    })();
   }
 
   // ===== Task 2: Remove star signal cards (robust version) =====
@@ -606,7 +823,7 @@
       lastUrl = location.href;
       if (location.hash.includes('monitor')) {
         // Reset processed cards on route change since React will render fresh DOM
-        processedCards = new WeakSet();
+        processedCards._cards = [];  // Clear all processed card references
         setTimeout(runAll, 500);
         setTimeout(runAll, 1200);
         setTimeout(runAll, 2500);
