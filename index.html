@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>股票策略智能匹配系统</title>
+    <meta name="description" content="基于自适应市场假说的三维智能匹配引擎 - 专业级量化投资平台" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <script type="module" crossorigin src="./assets/index-97gBSAr5.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-CPju7Wnj.css">
+    <style>
+      /* 信号反思反馈默认折叠 */
+      .signal-reflection-wrap .reflection-body { display: none; }
+      .signal-reflection-wrap.expanded .reflection-body { display: block; }
+      .signal-reflection-wrap .reflection-arrow {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 20px; height: 20px; margin-left: 6px; cursor: pointer;
+        opacity: 0.5; transition: transform 0.3s ease, opacity 0.2s;
+      }
+      .signal-reflection-wrap .reflection-arrow:hover { opacity: 1; }
+      .signal-reflection-wrap.expanded .reflection-arrow { transform: rotate(180deg); }
+      .reflection-header-row { cursor: pointer; user-select: none; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+(function() {
+  var POLL_MS = 600;
+  var MAX_POLL = 40;
+  var pollCount = 0;
+  var pollTimer = null;
+  var lastUrl = location.href;
+
+  function findTextNode(text) {
+    var w = document.createTreeWalker(document.body, 4, null, false), n;
+    while (n = w.nextNode()) if (n.textContent.trim() === text) return n;
+    return null;
+  }
+
+  function findParentCard(textNode) {
+    var el = textNode.parentElement;
+    while (el && el !== document.body) {
+      var cls = el.className || '';
+      if (typeof cls === 'string' && cls.indexOf('data-card') >= 0) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function enhance() {
+    pollCount++;
+    if (pollCount > MAX_POLL) { clearInterval(pollTimer); return; }
+
+    // --- Find cards by their title text nodes ---
+    var rtNode = findTextNode('实时行情');
+    var hdNode = findTextNode('持仓管理');
+    if (!rtNode || !hdNode) return;
+
+    var rtCard = findParentCard(rtNode);
+    var hdCard = findParentCard(hdNode);
+    if (!rtCard || !hdCard) return;
+
+    // Must have inputs (React rendered)
+    if (!hdCard.querySelector('input')) return;
+
+    // Already done?
+    if (hdCard._enhanced) { clearInterval(pollTimer); return; }
+    hdCard._enhanced = true;
+    clearInterval(pollTimer);
+
+    // ===== 1. Signal reflection: default collapsed =====
+    var reflNode = findTextNode('信号反思反馈');
+    if (reflNode) {
+      var reflCard = findParentCard(reflNode);
+      if (reflCard) {
+        var hdr = reflCard.querySelector('.flex.items-center.justify-between') || reflCard.children[0];
+        var body = reflCard.querySelector('.overflow-x-auto') || (hdr && hdr.nextElementSibling);
+        if (hdr && body) {
+          reflCard.classList.add('signal-reflection-wrap');
+          body.classList.add('reflection-body');
+          hdr.classList.add('reflection-header-row');
+          var tdiv = hdr.querySelector('.tracking-wider') || hdr.querySelector('div');
+          if (tdiv && !tdiv.querySelector('.reflection-arrow')) {
+            var arr = document.createElement('span');
+            arr.className = 'reflection-arrow';
+            arr.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>';
+            tdiv.appendChild(arr);
+            hdr.addEventListener('click', function() { reflCard.classList.toggle('expanded'); });
+          }
+        }
+      }
+    }
+
+    // ===== 2. Move holding inputs into real-time card =====
+    var inputs = Array.from(hdCard.querySelectorAll('input, button'));
+    var useful = inputs.filter(function(el) {
+      var txt = (el.textContent || '').trim();
+      var ph = el.placeholder || '';
+      return /持仓|价格|标记/.test(ph) || /持仓|标记/.test(txt) || el.tagName === 'INPUT';
+    });
+    if (useful.length > 0 && !rtCard.querySelector('.holding-merged')) {
+      var box = document.createElement('div');
+      box.className = 'holding-merged';
+      box.style.cssText = 'margin-top:12px;padding-top:10px;border-top:1px solid rgba(206,209,213,0.08);';
+      var st = document.createElement('div');
+      st.className = 'font-mono text-[10px] text-ash/30 mb-2 tracking-wider';
+      st.textContent = '持仓标记';
+      box.appendChild(st);
+      useful.forEach(function(el) {
+        var wrap = document.createElement('div');
+        wrap.style.marginBottom = '6px';
+        if (el.tagName === 'INPUT') {
+          el.style.cssText = 'width:100%;background:rgba(11,12,16,0.6);border:1px solid rgba(206,209,213,0.12);padding:6px 8px;font-size:12px;font-family:JetBrains Mono,monospace;color:#F4F4F4;border-radius:4px;outline:none;box-sizing:border-box;';
+          el.addEventListener('focus', function() { this.style.borderColor = 'rgba(0,255,148,0.4)'; });
+          el.addEventListener('blur', function() { this.style.borderColor = 'rgba(206,209,213,0.12)'; });
+        } else if (el.tagName === 'BUTTON') {
+          el.style.cssText = 'width:100%;padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;background:rgba(0,255,148,0.08);border:1px solid rgba(0,255,148,0.25);color:#00FF94;border-radius:4px;cursor:pointer;';
+        }
+        wrap.appendChild(el);
+        box.appendChild(wrap);
+      });
+      var last = rtCard.lastElementChild;
+      if (last) last.after(box); else rtCard.appendChild(box);
+    }
+
+    // ===== 3. Replace holding card with latest buy/sell signal =====
+    var sigs = [];
+    document.querySelectorAll('.flex.items-center.gap-2').forEach(function(it) {
+      // Check if this is a signal row from the signals list
+      var spans = it.querySelectorAll(':scope > span');
+      if (spans.length >= 4) {
+        var type = spans[0].textContent.trim();
+        if (type === '买入' || type === '卖出') {
+          sigs.push({ type: type, time: spans[1] && spans[1].textContent.trim(),
+            reason: spans[2] && spans[2].textContent.trim(), price: spans[3] && spans[3].textContent.trim() });
+        }
+      }
+    });
+
+    hdCard.innerHTML = '';
+    var nt = document.createElement('div');
+    nt.className = 'font-mono text-[11px] text-ash/40 mb-3 tracking-wider';
+    nt.textContent = '买卖信号';
+    hdCard.appendChild(nt);
+
+    if (sigs.length > 0) {
+      var s = sigs[0];
+      var c = s.type === '买入' ? '#00FF94' : '#FF2A6D';
+      var b = s.type === '买入' ? 'rgba(0,255,148,0.08)' : 'rgba(255,42,109,0.08)';
+      var lb = document.createElement('div');
+      lb.className = 'font-heading text-2xl font-bold px-3 py-1 mb-3 inline-block';
+      lb.style.cssText = 'color:'+c+';background:'+b+';border:1px solid '+c+'30;font-size:22px;';
+      lb.textContent = s.type;
+      hdCard.appendChild(lb);
+      if (s.reason) {
+        var rtt = document.createElement('div');
+        rtt.className = 'font-mono text-[10px] text-ash/40 mb-1.5';
+        rtt.textContent = '触发条件';
+        hdCard.appendChild(rtt);
+        var rw = document.createElement('div');
+        rw.className = 'flex items-center gap-2 mb-1';
+        rw.innerHTML = '<span style="color:'+c+';font-size:10px">&#9679;</span><span class="font-mono text-xs text-pure">'+s.reason+'</span>';
+        hdCard.appendChild(rw);
+      }
+      if (s.price) {
+        var gd = document.createElement('div');
+        gd.className = 'grid grid-cols-2 gap-2 pt-3 mt-3';
+        gd.style.borderTop = '1px solid rgba(206,209,213,0.06)';
+        gd.innerHTML = '<div><div class="font-mono text-[9px] text-ash/30">信号价</div><div class="font-mono text-sm text-pure">'+s.price+'</div></div>'+
+          '<div><div class="font-mono text-[9px] text-ash/30">时间</div><div class="font-mono text-sm text-pure">'+s.time+'</div></div>';
+        hdCard.appendChild(gd);
+      }
+      if (sigs.length > 1) {
+        var m = document.createElement('div');
+        m.className = 'mt-2 font-mono text-[9px] text-ash/25';
+        m.textContent = '下方共 '+sigs.length+' 个历史信号';
+        hdCard.appendChild(m);
+      }
+    } else {
+      var em = document.createElement('div');
+      em.className = 'font-mono text-xs text-ash/30 text-center py-4';
+      em.textContent = '暂无活跃信号';
+      hdCard.appendChild(em);
+    }
+  }
+
+  function start() {
+    pollCount = 0;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(enhance, POLL_MS);
+    setTimeout(enhance, 1000);
+  }
+
+  if (document.readyState === 'loading') window.addEventListener('load', start);
+  else start();
+
+  setInterval(function() {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      start();
+    }
+  }, 500);
+})();
+    </script>
+  </body>
+</html>
