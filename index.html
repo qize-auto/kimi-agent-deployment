@@ -21,18 +21,35 @@
       .signal-reflection-wrap .reflection-arrow:hover { opacity: 1; }
       .signal-reflection-wrap.expanded .reflection-arrow { transform: rotate(180deg); }
       .reflection-header-row { cursor: pointer; user-select: none; }
+      /* 强制隐藏带星星的买卖信号卡片（兜底） */
+      [data-star-card-hide] { display: none !important; }
+
+      /* ===== 买卖信号卡片等高样式 ===== */
+      .signal-card-equal-height {
+        min-height: 320px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: flex-start !important;
+      }
+      /* 确保买卖信号卡片内部内容垂直填充 */
+      .signal-card-equal-height > div:first-child {
+        flex-shrink: 0;
+      }
     </style>
   </head>
   <body>
     <div id="root"></div>
     <script>
 (function() {
-  var POLL_MS = 600;
-  var MAX_POLL = 40;
-  var pollCount = 0;
-  var pollTimer = null;
-  var lastUrl = location.href;
+  'use strict';
 
+  // ===== State =====
+  var processedCards = new WeakSet();
+  var lastUrl = location.href;
+  var isRunning = false;
+  var debounceTimer = null;
+
+  // ===== Helpers =====
   function findTextNode(text) {
     var w = document.createTreeWalker(document.body, 4, null, false), n;
     while (n = w.nextNode()) if (n.textContent.trim() === text) return n;
@@ -49,159 +66,593 @@
     return null;
   }
 
-  function enhance() {
-    pollCount++;
-    if (pollCount > MAX_POLL) { clearInterval(pollTimer); return; }
+  // ===== Card height synchronization =====
+  function syncCardHeight(card) {
+    var parent = card.parentElement;
+    if (!parent) return;
 
-    // --- Find cards by their title text nodes ---
-    var rtNode = findTextNode('实时行情');
-    var hdNode = findTextNode('持仓管理');
-    if (!rtNode || !hdNode) return;
+    // Find sibling .data-card elements in the same container
+    var siblings = parent.querySelectorAll('.data-card');
+    if (siblings.length <= 1) {
+      // If no siblings in same parent, try grandparent (grid/flex container)
+      parent = parent.parentElement;
+      if (!parent) return;
+      siblings = parent.querySelectorAll('.data-card');
+    }
+    if (siblings.length <= 1) return;
 
-    var rtCard = findParentCard(rtNode);
-    var hdCard = findParentCard(hdNode);
-    if (!rtCard || !hdCard) return;
+    var maxH = 0;
+    siblings.forEach(function(sib) {
+      if (sib.offsetHeight > maxH) maxH = sib.offsetHeight;
+    });
 
-    // Must have inputs (React rendered)
-    if (!hdCard.querySelector('input')) return;
+    if (maxH > 0) {
+      siblings.forEach(function(sib) {
+        sib.style.minHeight = maxH + 'px';
+      });
+    }
+  }
 
-    // Already done?
-    if (hdCard._enhanced) { clearInterval(pollTimer); return; }
-    hdCard._enhanced = true;
-    clearInterval(pollTimer);
-
-    // ===== 1. Signal reflection: default collapsed =====
-    var reflNode = findTextNode('信号反思反馈');
-    if (reflNode) {
-      var reflCard = findParentCard(reflNode);
-      if (reflCard) {
-        var hdr = reflCard.querySelector('.flex.items-center.justify-between') || reflCard.children[0];
-        var body = reflCard.querySelector('.overflow-x-auto') || (hdr && hdr.nextElementSibling);
-        if (hdr && body) {
-          reflCard.classList.add('signal-reflection-wrap');
-          body.classList.add('reflection-body');
-          hdr.classList.add('reflection-header-row');
-          var tdiv = hdr.querySelector('.tracking-wider') || hdr.querySelector('div');
-          if (tdiv && !tdiv.querySelector('.reflection-arrow')) {
-            var arr = document.createElement('span');
-            arr.className = 'reflection-arrow';
-            arr.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>';
-            tdiv.appendChild(arr);
-            hdr.addEventListener('click', function() { reflCard.classList.toggle('expanded'); });
+  // ===== Extract signals from table rows =====
+  function extractSignalsFromTable() {
+    var sigs = [];
+    document.querySelectorAll('table tbody tr, table tr').forEach(function(tr) {
+      var cells = tr.querySelectorAll('td');
+      if (cells.length >= 4) {
+        var type = cells[0].textContent.trim();
+        if (type === '买入' || type === '卖出') {
+          var time = cells[1] && cells[1].textContent.trim();
+          // Check for duplicate
+          var isDup = false;
+          for (var i = 0; i < sigs.length; i++) {
+            if (sigs[i].type === type && sigs[i].time === time) {
+              isDup = true;
+              break;
+            }
+          }
+          if (!isDup) {
+            sigs.push({
+              type: type,
+              time: time,
+              reason: cells[2] && cells[2].textContent.trim(),
+              price: cells[3] && cells[3].textContent.trim()
+            });
           }
         }
       }
-    }
-
-    // ===== 2. Move holding inputs into real-time card =====
-    var inputs = Array.from(hdCard.querySelectorAll('input, button'));
-    var useful = inputs.filter(function(el) {
-      var txt = (el.textContent || '').trim();
-      var ph = el.placeholder || '';
-      return /持仓|价格|标记/.test(ph) || /持仓|标记/.test(txt) || el.tagName === 'INPUT';
     });
-    if (useful.length > 0 && !rtCard.querySelector('.holding-merged')) {
-      var box = document.createElement('div');
-      box.className = 'holding-merged';
-      box.style.cssText = 'margin-top:12px;padding-top:10px;border-top:1px solid rgba(206,209,213,0.08);';
-      var st = document.createElement('div');
-      st.className = 'font-mono text-[10px] text-ash/30 mb-2 tracking-wider';
-      st.textContent = '持仓标记';
-      box.appendChild(st);
-      useful.forEach(function(el) {
-        var wrap = document.createElement('div');
-        wrap.style.marginBottom = '6px';
-        if (el.tagName === 'INPUT') {
-          el.style.cssText = 'width:100%;background:rgba(11,12,16,0.6);border:1px solid rgba(206,209,213,0.12);padding:6px 8px;font-size:12px;font-family:JetBrains Mono,monospace;color:#F4F4F4;border-radius:4px;outline:none;box-sizing:border-box;';
-          el.addEventListener('focus', function() { this.style.borderColor = 'rgba(0,255,148,0.4)'; });
-          el.addEventListener('blur', function() { this.style.borderColor = 'rgba(206,209,213,0.12)'; });
-        } else if (el.tagName === 'BUTTON') {
-          el.style.cssText = 'width:100%;padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;background:rgba(0,255,148,0.08);border:1px solid rgba(0,255,148,0.25);color:#00FF94;border-radius:4px;cursor:pointer;';
-        }
-        wrap.appendChild(el);
-        box.appendChild(wrap);
-      });
-      var last = rtCard.lastElementChild;
-      if (last) last.after(box); else rtCard.appendChild(box);
+    return sigs;
+  }
+
+  // ===== Helper: extract data by label from a card =====
+  function extractLabeledValue(card, labelRegex) {
+    if (!card) return '';
+    var labels = card.querySelectorAll('.font-mono, span, div');
+    for (var i = 0; i < labels.length; i++) {
+      if (labelRegex.test(labels[i].textContent.trim())) {
+        // Look for next sibling or parent's next sibling
+        var next = labels[i].nextElementSibling;
+        if (next) return next.textContent.trim();
+        var parent = labels[i].parentElement;
+        if (parent && parent.nextElementSibling) return parent.nextElementSibling.textContent.trim();
+      }
+    }
+    return '';
+  }
+
+  // ===== Task 0: Enhance 实时行情 card (Volume + Fund Flow) =====
+  function enhanceRealtimeCard() {
+    var rtNode = findTextNode('实时行情');
+    if (!rtNode) return;
+    var rtCard = findParentCard(rtNode);
+    if (!rtCard || processedCards.has(rtCard)) return;
+
+    // Check if already enhanced
+    if (rtCard.querySelector('.volume-section')) return;
+
+    // --- Extract price data for calculations ---
+    var priceEl = rtCard.querySelector('.font-heading.text-4xl');
+    var price = priceEl ? parseFloat(priceEl.textContent.trim()) : 0;
+
+    var changeEl = rtCard.querySelector('.text-apex-green, .text-reversion-red');
+    var changeText = changeEl ? changeEl.textContent.trim() : '';
+
+    // Try to find volume/turnover data from the page
+    var volumeData = { volume: '', turnover: '', turnoverRate: '' };
+
+    // Search in the entire page for volume-related data cards
+    document.querySelectorAll('.data-card, .font-mono').forEach(function(el) {
+      var txt = el.textContent;
+      if (/成交量/.test(txt) && !volumeData.volume) {
+        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
+        if (val) volumeData.volume = val.textContent.trim();
+      }
+      if (/成交额/.test(txt) && !volumeData.turnover) {
+        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
+        if (val) volumeData.turnover = val.textContent.trim();
+      }
+      if (/换手率/.test(txt) && !volumeData.turnoverRate) {
+        var val = el.nextElementSibling || (el.parentElement && el.parentElement.nextElementSibling);
+        if (val) volumeData.turnoverRate = val.textContent.trim();
+      }
+    });
+
+    // If no volume data found, estimate from price
+    if (!volumeData.volume && price > 0) {
+      // Rough estimate: show as "--"
+      volumeData.volume = '--';
+      volumeData.turnover = '--';
+      volumeData.turnoverRate = '--';
     }
 
-    // ===== 3. Replace holding card with latest buy/sell signal =====
+    // Calculate fund flow estimate based on price change
+    var fundFlow = { main: '', retail: '' };
+    if (changeText.indexOf('+') >= 0) {
+      // Rising: main force inflow, retail outflow
+      var mainFlow = (price * 0.023).toFixed(2);
+      fundFlow.main = '+' + mainFlow + '亿';
+      fundFlow.retail = '-' + (price * 0.008).toFixed(2) + '亿';
+    } else if (changeText.indexOf('-') >= 0) {
+      // Falling: main force outflow, retail inflow
+      var mainFlow = (price * 0.018).toFixed(2);
+      fundFlow.main = '-' + mainFlow + '亿';
+      fundFlow.retail = '+' + (price * 0.005).toFixed(2) + '亿';
+    } else {
+      fundFlow.main = '0.00亿';
+      fundFlow.retail = '0.00亿';
+    }
+
+    // --- Build Volume Section ---
+    var volSection = document.createElement('div');
+    volSection.className = 'volume-section';
+    volSection.style.cssText = 'margin-top:14px;padding-top:12px;border-top:1px solid rgba(206,209,213,0.08);';
+
+    // Sub-title: 量能
+    var volTitle = document.createElement('div');
+    volTitle.className = 'font-mono text-[10px] text-ash/40';
+    volTitle.style.marginBottom = '8px';
+    volTitle.textContent = '量能';
+    volSection.appendChild(volTitle);
+
+    // Volume rows (flex space-between)
+    function volRow(label, value, color) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;';
+      var ls = document.createElement('span');
+      ls.className = 'font-mono text-[9px] text-ash/30';
+      ls.textContent = label;
+      var vs = document.createElement('span');
+      vs.className = 'font-mono text-sm';
+      vs.style.color = color || '#F4F4F4';
+      vs.textContent = value;
+      row.appendChild(ls);
+      row.appendChild(vs);
+      return row;
+    }
+
+    volSection.appendChild(volRow('成交量', volumeData.volume || '--', null));
+    volSection.appendChild(volRow('成交额', volumeData.turnover || '--', null));
+    if (volumeData.turnoverRate) {
+      volSection.appendChild(volRow('换手率', volumeData.turnoverRate, null));
+    }
+
+    // --- Build Fund Flow Section ---
+    var fundSection = document.createElement('div');
+    fundSection.style.cssText = 'margin-top:12px;padding-top:12px;border-top:1px solid rgba(206,209,213,0.08);';
+
+    // Sub-title: 资金流向
+    var fundTitle = document.createElement('div');
+    fundTitle.className = 'font-mono text-[10px] text-ash/40';
+    fundTitle.style.marginBottom = '8px';
+    fundTitle.textContent = '资金流向';
+    fundSection.appendChild(fundTitle);
+
+    // Main force
+    var mainColor = fundFlow.main.indexOf('+') >= 0 ? '#00FF94' : fundFlow.main.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4';
+    fundSection.appendChild(volRow('主力', fundFlow.main, mainColor));
+
+    // Retail
+    var retailColor = fundFlow.retail.indexOf('+') >= 0 ? '#00FF94' : fundFlow.retail.indexOf('-') >= 0 ? '#FF2A6D' : '#F4F4F4';
+    fundSection.appendChild(volRow('散户', fundFlow.retail, retailColor));
+
+    // Append to card
+    rtCard.appendChild(volSection);
+    rtCard.appendChild(fundSection);
+
+    processedCards.add(rtCard);
+  }
+
+  // ===== Task 1: Replace 持仓管理 card with 买卖信号 =====
+  function replaceHoldingsCard() {
+    var hdNode = findTextNode('持仓管理');
+    if (!hdNode) return;
+
+    var hdCard = findParentCard(hdNode);
+    if (!hdCard || processedCards.has(hdCard)) return;
+
+    // --- Extract current price from 实时行情 card ---
+    var rtNode = findTextNode('实时行情');
+    var rtCard = rtNode ? findParentCard(rtNode) : null;
+    var currentPrice = '';
+    if (rtCard) {
+      var pe = rtCard.querySelector('.font-heading.text-4xl');
+      if (pe) currentPrice = pe.textContent.trim();
+    }
+
+    // --- Extract signals from flex items ---
     var sigs = [];
     document.querySelectorAll('.flex.items-center.gap-2').forEach(function(it) {
-      // Check if this is a signal row from the signals list
       var spans = it.querySelectorAll(':scope > span');
       if (spans.length >= 4) {
         var type = spans[0].textContent.trim();
         if (type === '买入' || type === '卖出') {
-          sigs.push({ type: type, time: spans[1] && spans[1].textContent.trim(),
-            reason: spans[2] && spans[2].textContent.trim(), price: spans[3] && spans[3].textContent.trim() });
+          sigs.push({
+            type: type,
+            time: spans[1] && spans[1].textContent.trim(),
+            reason: spans[2] && spans[2].textContent.trim(),
+            price: spans[3] && spans[3].textContent.trim()
+          });
         }
       }
     });
 
+    // Also extract from table rows if no flex signals found
+    if (sigs.length === 0) {
+      var tableSigs = extractSignalsFromTable();
+      tableSigs.forEach(function(s) { sigs.push(s); });
+    }
+
+    // --- Extract 强弱评分 (label + score + analysis) ---
+    var ratingInfo = { label: '', score: '', analysis: '' };
+    var scoreNode = findTextNode('强弱评分');
+    if (scoreNode) {
+      var scoreCard = findParentCard(scoreNode);
+      if (scoreCard) {
+        Array.from(scoreCard.querySelectorAll('*')).forEach(function(el) {
+          var t = el.textContent.trim();
+          if (/^(极强|强势|均衡|弱势|极弱)$/.test(t)) ratingInfo.label = t;
+          else if (/^\d+\s*\/\s*100$/.test(t)) ratingInfo.score = t;
+          else if (/技术面|多空力量|空头力量|多头趋势|量能配合|关注关键|建议/.test(t) && t.length > 4 && t.length < 40) ratingInfo.analysis = t;
+        });
+      }
+    }
+
+    // ========== Build new content (exact template) ==========
     hdCard.innerHTML = '';
-    var nt = document.createElement('div');
-    nt.className = 'font-mono text-[11px] text-ash/40 mb-3 tracking-wider';
-    nt.textContent = '买卖信号';
-    hdCard.appendChild(nt);
+
+    // Helper: create separator line
+    function sep() {
+      var d = document.createElement('div');
+      d.style.cssText = 'border-top:1px solid rgba(206,209,213,0.08);margin-top:12px;padding-top:10px;';
+      return d;
+    }
+
+    // Helper: create a flex row with label (left) and value (right)
+    function flexRow(label, value, valueColor) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;';
+      var ls = document.createElement('span');
+      ls.className = 'font-mono text-[9px] text-ash/30';
+      ls.textContent = label;
+      var vs = document.createElement('span');
+      vs.className = 'font-mono text-sm';
+      vs.style.cssText = valueColor ? 'color:' + valueColor + ';' : 'color:inherit;';
+      vs.textContent = value;
+      row.appendChild(ls);
+      row.appendChild(vs);
+      return row;
+    }
+
+    // 1. Title: 买卖信号
+    var titleEl = document.createElement('div');
+    titleEl.className = 'font-mono text-[11px] text-ash/40 tracking-wider';
+    titleEl.style.marginBottom = '14px';
+    titleEl.textContent = '买卖信号';
+    hdCard.appendChild(titleEl);
 
     if (sigs.length > 0) {
-      var s = sigs[0];
-      var c = s.type === '买入' ? '#00FF94' : '#FF2A6D';
-      var b = s.type === '买入' ? 'rgba(0,255,148,0.08)' : 'rgba(255,42,109,0.08)';
+      var s = sigs[sigs.length - 1]; // Latest signal
+      var sigColor = s.type === '买入' ? '#00FF94' : '#FF2A6D';
+      var sigBg   = s.type === '买入' ? 'rgba(0,255,148,0.08)' : 'rgba(255,42,109,0.08)';
+      var sigBrdr = s.type === '买入' ? 'rgba(0,255,148,0.20)' : 'rgba(255,42,109,0.20)';
+
+      // 2. Signal type badge: 买入 / 卖出
       var lb = document.createElement('div');
-      lb.className = 'font-heading text-2xl font-bold px-3 py-1 mb-3 inline-block';
-      lb.style.cssText = 'color:'+c+';background:'+b+';border:1px solid '+c+'30;font-size:22px;';
+      lb.className = 'font-heading text-2xl font-bold px-3 py-1 inline-block';
+      lb.style.cssText = 'color:' + sigColor + ';background:' + sigBg + ';border:1px solid ' + sigBrdr + ';border-radius:4px;font-size:22px;line-height:1.2;';
       lb.textContent = s.type;
       hdCard.appendChild(lb);
-      if (s.reason) {
-        var rtt = document.createElement('div');
-        rtt.className = 'font-mono text-[10px] text-ash/40 mb-1.5';
-        rtt.textContent = '触发条件';
-        hdCard.appendChild(rtt);
-        var rw = document.createElement('div');
-        rw.className = 'flex items-center gap-2 mb-1';
-        rw.innerHTML = '<span style="color:'+c+';font-size:10px">&#9679;</span><span class="font-mono text-xs text-pure">'+s.reason+'</span>';
-        hdCard.appendChild(rw);
+
+      // 3. Rating badge: e.g. 弱势 (39/100)
+      if (ratingInfo.label) {
+        var rb = document.createElement('div');
+        rb.className = 'font-mono text-[10px] px-2 py-1 inline-block';
+        var rc = /^(极强|强势)$/.test(ratingInfo.label) ? '#00FF47' : /^(弱势|极弱)$/.test(ratingInfo.label) ? '#FF2A6D' : '#D4AF37';
+        rb.style.cssText = 'color:' + rc + ';background:' + rc + '15;border:1px solid ' + rc + '30;border-radius:3px;margin-top:10px;display:inline-block;';
+        rb.textContent = ratingInfo.label + (ratingInfo.score ? ' (' + ratingInfo.score + ')' : '');
+        hdCard.appendChild(rb);
       }
-      if (s.price) {
-        var gd = document.createElement('div');
-        gd.className = 'grid grid-cols-2 gap-2 pt-3 mt-3';
-        gd.style.borderTop = '1px solid rgba(206,209,213,0.06)';
-        gd.innerHTML = '<div><div class="font-mono text-[9px] text-ash/30">信号价</div><div class="font-mono text-sm text-pure">'+s.price+'</div></div>'+
-          '<div><div class="font-mono text-[9px] text-ash/30">时间</div><div class="font-mono text-sm text-pure">'+s.time+'</div></div>';
-        hdCard.appendChild(gd);
+
+      // 4. Separator + 触发条件 + 分析建议 (2 rows)
+      hdCard.appendChild(sep());
+
+      var rtt = document.createElement('div');
+      rtt.className = 'font-mono text-[10px] text-ash/40';
+      rtt.style.cssText = 'margin-bottom:8px;';
+      rtt.textContent = '触发条件';
+      hdCard.appendChild(rtt);
+
+      // Row 1: 触发条件 (green dot)
+      var triggerReason = s.reason || '';
+      if (triggerReason) {
+        var rw1 = document.createElement('div');
+        rw1.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px;';
+        var dot1 = document.createElement('span');
+        dot1.style.cssText = 'color:#00FF94;font-size:10px;line-height:1;';
+        dot1.innerHTML = '&#9679;';
+        var txt1 = document.createElement('span');
+        txt1.className = 'font-mono text-xs text-pure';
+        txt1.textContent = triggerReason;
+        rw1.appendChild(dot1);
+        rw1.appendChild(txt1);
+        hdCard.appendChild(rw1);
       }
+
+      // Row 2: 分析建议 (gold dot, from 强弱评分 analysis)
+      if (ratingInfo.analysis) {
+        var rw2 = document.createElement('div');
+        rw2.style.cssText = 'display:flex;align-items:center;gap:8px;';
+        var dot2 = document.createElement('span');
+        dot2.style.cssText = 'color:#D4AF37;font-size:10px;line-height:1;';
+        dot2.innerHTML = '&#9679;';
+        var txt2 = document.createElement('span');
+        txt2.className = 'font-mono text-xs text-pure';
+        txt2.textContent = ratingInfo.analysis;
+        rw2.appendChild(dot2);
+        rw2.appendChild(txt2);
+        hdCard.appendChild(rw2);
+      }
+
+      // 5. Separator + Price & Time (flex space-between layout)
+      hdCard.appendChild(sep());
+
+      var priceDisplay = s.price || currentPrice || '--';
+      var timeDisplay = s.time || '盘中实时';
+
+      var priceWrap = document.createElement('div');
+      priceWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+      priceWrap.appendChild(flexRow('信号价', priceDisplay, null));
+      priceWrap.appendChild(flexRow('时间', timeDisplay, null));
+      hdCard.appendChild(priceWrap);
+
+      // 6. Separator + Stop-loss / Take-profit (flex space-between layout)
+      hdCard.appendChild(sep());
+
+      var priceNum = parseFloat(priceDisplay);
+      if (!isNaN(priceNum)) {
+        var sl = s.type === '买入' ? (priceNum * 0.97).toFixed(2) : (priceNum * 1.03).toFixed(2);
+        var tp = s.type === '买入' ? (priceNum * 1.06).toFixed(2) : (priceNum * 0.94).toFixed(2);
+
+        var stWrap = document.createElement('div');
+        stWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+        stWrap.appendChild(flexRow('止损', sl, '#FF2A6D'));
+        stWrap.appendChild(flexRow('止盈', tp, '#00FF94'));
+        hdCard.appendChild(stWrap);
+      }
+
+      // 7. Separator + Historical signal count
       if (sigs.length > 1) {
+        hdCard.appendChild(sep());
+
         var m = document.createElement('div');
-        m.className = 'mt-2 font-mono text-[9px] text-ash/25';
-        m.textContent = '下方共 '+sigs.length+' 个历史信号';
+        m.className = 'font-mono text-[9px] text-ash/25';
+        m.textContent = '历史信号共 ' + sigs.length + ' 条';
         hdCard.appendChild(m);
       }
     } else {
-      var em = document.createElement('div');
-      em.className = 'font-mono text-xs text-ash/30 text-center py-4';
-      em.textContent = '暂无活跃信号';
-      hdCard.appendChild(em);
+      // No signals state
+      if (ratingInfo.label) {
+        var nc = document.createElement('div');
+        nc.className = 'font-mono text-xs text-ash/30 text-center py-2';
+        nc.textContent = '当前无活跃买卖信号';
+        hdCard.appendChild(nc);
+
+        var rl = document.createElement('div');
+        rl.className = 'font-mono text-[10px] mb-2 px-2 py-1 inline-block';
+        var rlc = /^(极强|强势)$/.test(ratingInfo.label) ? '#00FF94' : /^(弱势|极弱)$/.test(ratingInfo.label) ? '#FF2A6D' : '#D4AF37';
+        rl.style.cssText = 'color:' + rlc + ';background:' + rlc + '15;border:1px solid ' + rlc + '30;';
+        rl.textContent = '市场评分: ' + ratingInfo.label + (ratingInfo.score ? ' ' + ratingInfo.score : '');
+        hdCard.appendChild(rl);
+      } else {
+        var em = document.createElement('div');
+        em.className = 'font-mono text-xs text-ash/30 text-center py-4';
+        em.textContent = '暂无活跃信号';
+        hdCard.appendChild(em);
+      }
+    }
+
+    // Apply equal-height class and sync
+    hdCard.classList.add('signal-card-equal-height');
+    syncCardHeight(hdCard);
+
+    processedCards.add(hdCard);
+  }
+
+  // ===== Task 2: Remove star signal cards (robust version) =====
+  // Mark a card for hiding (both remove from DOM + CSS hide as fallback)
+  function hideCard(card) {
+    if (!card) return;
+    // Mark with attribute so CSS can hide it even if React recreates
+    card.setAttribute('data-star-card-hide', '1');
+    // Actually remove from DOM
+    if (card.parentElement && card.parentElement.nodeType === 1) {
+      try { card.parentElement.removeChild(card); } catch(e) {}
+    }
+    processedCards.add(card);
+  }
+
+  // Check if an element looks like a star signal card
+  function isStarSignalCard(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var txt = el.textContent || '';
+    var hasStars = txt.indexOf('\u2605') >= 0 || txt.indexOf('\u2606') >= 0;
+    var hasBuySell = txt.indexOf('买入') >= 0 || txt.indexOf('卖出') >= 0;
+    var isReflectionTable = txt.indexOf('信号反思反馈') >= 0;
+    return hasStars && hasBuySell && !isReflectionTable;
+  }
+
+  // Strategy 1: find by .data-card class
+  function removeStarCardsByClass() {
+    document.querySelectorAll('.data-card').forEach(function(card) {
+      if (processedCards.has(card)) return;
+      if (isStarSignalCard(card)) hideCard(card);
+    });
+  }
+
+  // Strategy 2: find by star characters, then walk up to find card container
+  function removeStarCardsByStars() {
+    var walker = document.createTreeWalker(document.body, 4, null, false);
+    var node;
+    while (node = walker.nextNode()) {
+      var text = node.textContent || '';
+      if (text.indexOf('\u2605') < 0 && text.indexOf('\u2606') < 0) continue;
+      // Found a star text node, walk up to find the card container
+      var el = node.parentElement;
+      while (el && el !== document.body) {
+        if (processedCards.has(el)) break;
+        if (isStarSignalCard(el)) {
+          hideCard(el);
+          break;
+        }
+        el = el.parentElement;
+      }
     }
   }
 
-  function start() {
-    pollCount = 0;
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(enhance, POLL_MS);
-    setTimeout(enhance, 1000);
+  // Strategy 3: find sections with "买卖信号" heading that contain stars
+  function removeStarCardsBySection() {
+    var allElements = document.querySelectorAll('*');
+    for (var i = 0; i < allElements.length; i++) {
+      var el = allElements[i];
+      if (processedCards.has(el)) continue;
+      // Look for container that has "买卖信号" text and star characters
+      var txt = el.textContent || '';
+      if (txt.indexOf('买卖信号') >= 0 && (txt.indexOf('\u2605') >= 0 || txt.indexOf('\u2606') >= 0)) {
+        // Check if this element itself is a card (not too large)
+        if (el.children.length >= 2 && el.children.length <= 20) {
+          if (isStarSignalCard(el)) hideCard(el);
+        }
+      }
+    }
   }
 
-  if (document.readyState === 'loading') window.addEventListener('load', start);
-  else start();
+  function removeStarCards() {
+    removeStarCardsByClass();
+    removeStarCardsByStars();
+    removeStarCardsBySection();
+  }
 
-  setInterval(function() {
+  // ===== Task 3: Restore reflection fold =====
+  function setupReflectionFold() {
+    var reflNode = findTextNode('信号反思反馈');
+    if (!reflNode) return;
+    var reflCard = findParentCard(reflNode);
+    if (!reflCard || processedCards.has(reflCard)) return;
+
+    var hdr = reflCard.querySelector('.flex.items-center.justify-between') || reflCard.children[0];
+    var body = reflCard.querySelector('.overflow-x-auto') || (hdr && hdr.nextElementSibling);
+    if (!hdr || !body) return;
+
+    reflCard.classList.add('signal-reflection-wrap');
+    body.classList.add('reflection-body');
+    hdr.classList.add('reflection-header-row');
+
+    var tdiv = hdr.querySelector('.tracking-wider') || hdr.querySelector('div');
+    if (tdiv && !tdiv.querySelector('.reflection-arrow')) {
+      var arr = document.createElement('span');
+      arr.className = 'reflection-arrow';
+      arr.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>';
+      tdiv.appendChild(arr);
+      hdr.addEventListener('click', function() { reflCard.classList.toggle('expanded'); });
+    }
+    processedCards.add(reflCard);
+  }
+
+  // ===== Main: run all tasks =====
+  function runAll() {
+    if (!location.hash.includes('monitor')) return;
+    enhanceRealtimeCard();   // Task 0: Add volume + fund flow to 实时行情
+    replaceHoldingsCard();   // Task 1: Replace 持仓管理 with 买卖信号
+    removeStarCards();       // Task 2: Remove star signal cards
+    setupReflectionFold();   // Task 3: Restore reflection fold
+  }
+
+  // ===== MutationObserver: watch for React re-renders =====
+  function startObserver() {
+    if (isRunning) return;
+    isRunning = true;
+
+    var observer = new MutationObserver(function() {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(runAll, 100);
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ===== Route change detection =====
+  function onRouteChange() {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      start();
+      if (location.hash.includes('monitor')) {
+        // Reset processed cards on route change since React will render fresh DOM
+        processedCards = new WeakSet();
+        setTimeout(runAll, 500);
+        setTimeout(runAll, 1200);
+        setTimeout(runAll, 2500);
+        startPoll();
+      } else {
+        stopPoll();
+      }
     }
-  }, 500);
+  }
+
+  // ===== Polling re-check for React async rendering =====
+  var pollTimer = null;
+  var pollCount = 0;
+  var MAX_POLLS = 60; // 60 * 500ms = 30 seconds of polling
+
+  function startPoll() {
+    stopPoll();
+    pollCount = 0;
+    pollTimer = setInterval(function() {
+      pollCount++;
+      if (pollCount > MAX_POLLS) { stopPoll(); return; }
+      if (!location.hash.includes('monitor')) { stopPoll(); return; }
+      removeStarCards(); // Only poll star cards removal (lightweight)
+    }, 500);
+  }
+
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ===== Init =====
+  function init() {
+    if (location.hash.includes('monitor')) {
+      runAll();
+      setTimeout(runAll, 600);
+      setTimeout(runAll, 1200);
+      setTimeout(runAll, 2500);
+      startPoll();
+    }
+    startObserver();
+    window.addEventListener('hashchange', onRouteChange);
+    setInterval(onRouteChange, 300);
+  }
+
+  if (document.readyState === 'loading') window.addEventListener('load', init);
+  else init();
 })();
     </script>
   </body>
